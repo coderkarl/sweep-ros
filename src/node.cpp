@@ -22,107 +22,133 @@
  * SOFTWARE.
  */
 
-#include "ros/ros.h"
+#include "rclcpp/rclcpp.hpp"
 #include <pcl/point_types.h>
-#include "sensor_msgs/PointCloud2.h"
+#include "sensor_msgs/msg/point_cloud2.h"
 #include <pcl/point_cloud.h>
 #include <pcl_conversions/pcl_conversions.h>
 #include <sweep/sweep.hpp>
 
-void publish_scan(ros::Publisher *pub,
-                  const sweep::scan *scan, std::string frame_id)
+class SweepNode : public rclcpp::Node
 {
-    pcl::PointCloud <pcl::PointXYZ> cloud;
-    sensor_msgs::PointCloud2 cloud_msg;
-    ros::Time ros_now = ros::Time::now();
-
-    float angle;
-    int32_t range;
-    float x;
-    float y;
-    int i = 0;
-
-    cloud.height = 1;
-    cloud.width = scan->samples.size();
-    cloud.points.resize(cloud.width * cloud.height);
-
-    for (const sweep::sample& sample : scan->samples)
+public:
+	SweepNode() : Node("sweep_node")
     {
-        range = sample.distance;
-        angle = ((float)sample.angle / 1000); //millidegrees to degrees
+		//Setup Publisher
+		m_pc2_pub = create_publisher<sensor_msgs::msg::PointCloud2>("pc2", 1000);
 
-        //Polar to Cartesian Conversion
-        x = (range * cos(DEG2RAD(angle))) / 100;
-        y = (range * sin(DEG2RAD(angle))) / 100;
+		m_serial_port = declare_parameter("serial_port", "/dev/ttyUSB0");
+        m_serial_baudrate = declare_parameter("serial_baudrate", 115200);
+        m_rotation_speed = declare_parameter("rotation_speed", 5);
+        m_sample_rate = declare_parameter("sample_rate", 500);
+        m_frame_id = declare_parameter("frame_id", "laser");
 
-        cloud.points[i].x = x;
-        cloud.points[i].y = y;
-        i++;
+        RCLCPP_INFO(this->get_logger(), "Sweep Node (port = %s) Initialized", m_serial_port.c_str());
+
+        //Create Sweep Driver Object
+        m_device_ptr = new sweep::sweep(m_serial_port.c_str() );
+
+        //Send Rotation Speed
+        m_device_ptr->set_motor_speed(m_rotation_speed);
+
+        //Send Sample Rate
+        m_device_ptr->set_sample_rate(m_sample_rate);
+
+        RCLCPP_INFO(this->get_logger(), "expected rotation frequency: %d (Hz)", m_rotation_speed);
+
+        //Start Scan
+        m_device_ptr->start_scanning();
     }
 
-    //Convert pcl PC to ROS PC2
-    pcl::toROSMsg(cloud, cloud_msg);
-    cloud_msg.header.frame_id = frame_id;
-    cloud_msg.header.stamp = ros_now;
+	~SweepNode()
+	{
+		try
+		{
+			m_device_ptr->stop_scanning();
+		}
+		catch(const sweep::device_error& e)
+		{
+			std::cerr << "Error: " << e.what() << std::endl;
+		}
+	}
 
-    ROS_DEBUG("Publishing a full scan");
-    pub->publish(cloud_msg);
-}
+	void update()
+	{
+		const sweep::scan scan = m_device_ptr->get_scan();
+		publish_scan(&scan, m_frame_id);
+	}
+
+	void publish_scan(const sweep::scan *scan, std::string frame_id)
+	{
+	    pcl::PointCloud<pcl::PointXYZ> cloud;
+	    sensor_msgs::msg::PointCloud2 cloud_msg;
+	    rclcpp::Time ros_now = now();
+
+	    float angle;
+	    int32_t range;
+	    float x;
+	    float y;
+	    int i = 0;
+
+	    cloud.height = 1;
+	    cloud.width = scan->samples.size();
+	    cloud.points.resize(cloud.width * cloud.height);
+
+	    for (const sweep::sample& sample : scan->samples)
+	    {
+	        range = sample.distance;
+	        angle = ((float)sample.angle / 1000); //millidegrees to degrees
+
+	        //Polar to Cartesian Conversion
+	        x = (range * cos(DEG2RAD(angle))) / 100;
+	        y = (range * sin(DEG2RAD(angle))) / 100;
+
+	        cloud.points[i].x = x;
+	        cloud.points[i].y = y;
+	        i++;
+	    }
+
+	    //Convert pcl PC to ROS PC2
+	    pcl::toROSMsg(cloud, cloud_msg);
+	    cloud_msg.header.frame_id = frame_id;
+	    cloud_msg.header.stamp = ros_now;
+
+	    RCLCPP_DEBUG(this->get_logger(), "Publishing a full scan");
+	    m_pc2_pub->publish(cloud_msg);
+	}
+
+    void stop()
+    {
+    	m_device_ptr->stop_scanning();
+    }
+
+private:
+    std::shared_ptr<rclcpp::Publisher<sensor_msgs::msg::PointCloud2> > m_pc2_pub;
+
+    std::string m_serial_port;
+    int m_serial_baudrate;
+    int m_rotation_speed;
+    int m_sample_rate;
+    std::string m_frame_id;
+
+    sweep::sweep* m_device_ptr;
+};
 
 
 int main(int argc, char *argv[]) try
 {
-    //Initialize Node and handles
-    ros::init(argc, argv, "sweep_node");
-    ros::NodeHandle nh;
-    ros::NodeHandle nh_private("~");
+	rclcpp::init(argc, argv);
+	auto node = std::make_shared<SweepNode>();
 
-    //Get Serial Parameters
-    std::string serial_port;
-    nh_private.param<std::string>("serial_port", serial_port, "/dev/ttyUSB0");
-    int serial_baudrate;
-    nh_private.param<int>("serial_baudrate", serial_baudrate, 115200);
-
-    //Get Scanner Parameters
-    int rotation_speed;
-    nh_private.param<int>("rotation_speed", rotation_speed, 5);
-
-    int sample_rate;
-    nh_private.param<int>("sample_rate", sample_rate, 500);
-
-    //Get frame id Parameters
-    std::string frame_id;
-    nh_private.param<std::string>("frame_id", frame_id, "laser_frame");
-
-    //Setup Publisher
-    ros::Publisher scan_pub = nh.advertise<sensor_msgs::PointCloud2>("pc2", 1000);
-
-    //Create Sweep Driver Object
-    sweep::sweep device{serial_port.c_str()};
-
-    //Send Rotation Speed
-    device.set_motor_speed(rotation_speed);
-
-    //Send Sample Rate
-    device.set_sample_rate(sample_rate);
-
-    ROS_INFO("expected rotation frequency: %d (Hz)", rotation_speed);
-
-    //Start Scan
-    device.start_scanning();
-
-    while (ros::ok())
+    while (rclcpp::ok())
     {
         //Grab Full Scan
-        const sweep::scan scan = device.get_scan();
-
-        publish_scan(&scan_pub, &scan, frame_id);
-
-        ros::spinOnce();
+        node->update();
+        rclcpp::spin_some(node);
     }
 
     //Stop Scanning & Destroy Driver
-    device.stop_scanning();
+    node->stop();
 }
 
     catch (const sweep::device_error& e) {
